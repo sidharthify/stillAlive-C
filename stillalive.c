@@ -5,8 +5,10 @@
  * Made by: Sidharth "Siddhi" Sharma (sidharthify)
  */
 
+#ifndef _WIN32
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,14 +16,36 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
-#include <unistd.h>
 #include <signal.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <mmsystem.h>
+#include <conio.h>
+#include <io.h>
+
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+
+#else
+#include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <errno.h>
+#endif
 
 #include "stillalive_data.h"
 
@@ -50,11 +74,90 @@ typedef enum {
 static scale_mode_t g_scale_mode = SCALE_ASPECT;
 static volatile sig_atomic_t g_winch_flag = 0;
 
-static struct termios g_orig_termios;
 static bool g_raw_mode = false;
-static pid_t g_audio_pid = 0;
 static bool g_running = true;
 static bool g_paused = false;
+
+#ifdef _WIN32
+static DWORD g_orig_in_mode = 0;
+static DWORD g_orig_out_mode = 0;
+static UINT g_orig_cp = 0;
+static UINT g_orig_out_cp = 0;
+static bool g_audio_playing = false;
+
+static void stop_audio(void) {
+    if (g_audio_playing) {
+        mciSendStringA("stop stillalive_bgm", NULL, 0, NULL);
+        mciSendStringA("close stillalive_bgm", NULL, 0, NULL);
+        g_audio_playing = false;
+    }
+}
+
+static void pause_audio(void) {
+    if (g_audio_playing) {
+        mciSendStringA("pause stillalive_bgm", NULL, 0, NULL);
+    }
+}
+
+static void resume_audio(void) {
+    if (g_audio_playing) {
+        mciSendStringA("resume stillalive_bgm", NULL, 0, NULL);
+    }
+}
+
+static void start_audio(const char *path, double start_sec) {
+    if (!path) return;
+    char full_path[MAX_PATH];
+    if (_fullpath(full_path, path, sizeof(full_path)) == NULL) {
+        strncpy(full_path, path, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
+    }
+    char cmd[MAX_PATH + 64];
+    mciSendStringA("close stillalive_bgm", NULL, 0, NULL);
+    snprintf(cmd, sizeof(cmd), "open \"%s\" type mpegvideo alias stillalive_bgm", full_path);
+    if (mciSendStringA(cmd, NULL, 0, NULL) != 0) {
+        snprintf(cmd, sizeof(cmd), "open \"%s\" alias stillalive_bgm", full_path);
+        if (mciSendStringA(cmd, NULL, 0, NULL) != 0) {
+            return;
+        }
+    }
+    mciSendStringA("set stillalive_bgm time format milliseconds", NULL, 0, NULL);
+    uint32_t from_ms = (uint32_t)(start_sec * 1000.0);
+    snprintf(cmd, sizeof(cmd), "play stillalive_bgm from %u", from_ms);
+    mciSendStringA(cmd, NULL, 0, NULL);
+    g_audio_playing = true;
+}
+
+static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    (void)ctrl_type;
+    g_running = false;
+    return TRUE;
+}
+
+#else
+static struct termios g_orig_termios;
+static pid_t g_audio_pid = 0;
+
+static void stop_audio(void) {
+    if (g_audio_pid > 0) {
+        kill(g_audio_pid, SIGTERM);
+        waitpid(g_audio_pid, NULL, WNOHANG);
+        g_audio_pid = 0;
+    }
+}
+
+static void pause_audio(void) {
+    if (g_audio_pid > 0) {
+        kill(g_audio_pid, SIGSTOP);
+    }
+}
+
+static void resume_audio(void) {
+    if (g_audio_pid > 0) {
+        kill(g_audio_pid, SIGCONT);
+    }
+}
+#endif
 
 static uint32_t g_credit_starts[NUM_CREDITS];
 static uint32_t g_credit_durs[NUM_CREDITS];
@@ -73,6 +176,20 @@ static char g_grid[MAX_GRID_ROWS][MAX_GRID_COLS];
  * any child player spawned for audio is also cleaned up here.
  */
 static void write_all(int fd, const void *buf, size_t count){
+#ifdef _WIN32
+    (void)fd;
+    const char *p = (const char *)buf;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    while (count > 0){
+        DWORD to_write = (count > 65535) ? 65535 : (DWORD)count;
+        DWORD written = 0;
+        if (!WriteFile(hOut, p, to_write, &written, NULL) || written == 0){
+            break;
+        }
+        p += written;
+        count -= (size_t)written;
+    }
+#else
     const char *p = (const char *)buf;
     while (count > 0){
         ssize_t n = write(fd, p, count);
@@ -87,20 +204,38 @@ static void write_all(int fd, const void *buf, size_t count){
         p += n;
         count -= (size_t)n;
     }
+#endif
 }
 
 static void restore_terminal(void){
-    if (g_audio_pid > 0) {
-        kill(g_audio_pid, SIGTERM);
-        waitpid(g_audio_pid, NULL, WNOHANG);
-        g_audio_pid = 0;
-    }
+    stop_audio();
     printf("\033[?2025l\033[?7h\033[?25h\033[?1049l\033[0m");
     fflush(stdout);
+
+#ifdef _WIN32
+    if (g_raw_mode){
+        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (g_orig_in_mode != 0) {
+            SetConsoleMode(hIn, g_orig_in_mode);
+        }
+        if (g_orig_out_mode != 0) {
+            SetConsoleMode(hOut, g_orig_out_mode);
+        }
+        if (g_orig_cp != 0) {
+            SetConsoleCP(g_orig_cp);
+        }
+        if (g_orig_out_cp != 0) {
+            SetConsoleOutputCP(g_orig_out_cp);
+        }
+        g_raw_mode = false;
+    }
+#else
     if (g_raw_mode){
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
         g_raw_mode = false;
     }
+#endif
 }
 
 static void handle_signal(int sig){
@@ -113,16 +248,41 @@ static void handle_signal(int sig){
  * we record the event so the renderer can immediately issue a full wipe
  * before rendering the newly scaled layout.
  */
+#ifndef _WIN32
 static void handle_winch(int sig) {
     (void)sig;
     g_winch_flag = 1;
 }
+#endif
 
 /*
  * raw mode turns off line buffering and echo so keypresses like spacebar
  * or the quit key register immediately without waiting for enter.
  */
 static void enable_raw_mode(void){
+#ifdef _WIN32
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    g_orig_cp = GetConsoleCP();
+    g_orig_out_cp = GetConsoleOutputCP();
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+
+    if (GetConsoleMode(hIn, &g_orig_in_mode)) {
+        DWORD in_mode = g_orig_in_mode;
+        in_mode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+        SetConsoleMode(hIn, in_mode);
+    }
+
+    if (GetConsoleMode(hOut, &g_orig_out_mode)) {
+        DWORD out_mode = g_orig_out_mode;
+        out_mode |= (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        SetConsoleMode(hOut, out_mode);
+    }
+
+    g_raw_mode = true;
+#else
     if (tcgetattr(STDIN_FILENO, &g_orig_termios) != 0){
         return;
     }
@@ -134,14 +294,102 @@ static void enable_raw_mode(void){
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
         g_raw_mode = true;
     }
+#endif
 }
 
 static uint64_t get_time_ms(void){
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    static int freq_init = 0;
+    if (!freq_init) {
+        QueryPerformanceFrequency(&freq);
+        freq_init = 1;
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)((counter.QuadPart * 1000) / freq.QuadPart);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+#endif
 }
 
+static void sleep_ms(uint32_t ms){
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000);
+#endif
+}
+
+static bool read_input_char(char *ch){
+#ifdef _WIN32
+    if (_isatty(0)) {
+        if (_kbhit()) {
+            int c = _getch();
+            if (c == 0 || c == 0xE0) {
+                if (_kbhit()) _getch();
+                return false;
+            }
+            if (c == 27) {
+                if (_kbhit()) {
+                    while (_kbhit()) {
+                        int esc_ch = _getch();
+                        if (esc_ch >= 0x40 && esc_ch <= 0x7E) break;
+                    }
+                    return false;
+                }
+            }
+            *ch = (char)c;
+            return true;
+        }
+        return false;
+    } else {
+        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD avail = 0;
+        if (PeekNamedPipe(hIn, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            DWORD read_bytes = 0;
+            if (ReadFile(hIn, ch, 1, &read_bytes, NULL) && read_bytes > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+#else
+    char c = 0;
+    if (read(STDIN_FILENO, &c, 1) > 0) {
+        *ch = c;
+        return true;
+    }
+    return false;
+#endif
+}
+
+static void get_terminal_size(int *rows, int *cols){
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        *cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        *rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    } else {
+        *cols = 100;
+        *rows = 40;
+    }
+#else
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
+        *rows = 40;
+        *cols = 100;
+    } else {
+        *rows = ws.ws_row;
+        *cols = ws.ws_col;
+    }
+#endif
+    if (*rows <= 0) *rows = 40;
+    if (*cols <= 0) *cols = 100;
+}
 /*
  * calculate the cumulative typing timestamps for the credits roll.
  * the velocity is roughly sixty eight milliseconds per character based on
@@ -161,19 +409,32 @@ static void init_credits_timeline(void) {
 
 static const char *find_audio_file(void){
     static const char *candidates[] = {
+#ifdef _WIN32
+        "res/song/stillalive.mp3",
+        "res/song/stillalive.m4a",
+        "res/song/stillalive.ogg",
+#else
         "res/song/stillalive.ogg",
         "res/song/stillalive.mp3",
         "res/song/stillalive.m4a",
+#endif
         NULL
     };
     for (int i = 0; candidates[i] != NULL; i += 1) {
+#ifdef _WIN32
+        if (_access(candidates[i], 0) == 0){
+            return candidates[i];
+        }
+#else
         if (access(candidates[i], R_OK) == 0){
             return candidates[i];
         }
+#endif
     }
     return NULL;
 }
 
+#ifndef _WIN32
 /*
  * rather than linking a heavy audio framework, we fork an external player.
  * pipewire, pulseaudio, sox, alsa, and ffmpeg CLI tools are probed in order
@@ -247,6 +508,11 @@ static pid_t launch_audio_player(const char *path, double start_sec) {
     }
     return pid;
 }
+
+static void start_audio(const char *path, double start_sec) {
+    g_audio_pid = launch_audio_player(path, start_sec);
+}
+#endif
 
 /*
  * the main rendering engine.
@@ -638,9 +904,15 @@ int main(int argc, char *argv[]) {
     srand((unsigned int)time(NULL));
     init_credits_timeline();
 
+#ifdef _WIN32
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+#else
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGWINCH, handle_winch);
+#endif
 
     atexit(restore_terminal);
     enable_raw_mode();
@@ -663,7 +935,7 @@ int main(int argc, char *argv[]) {
 
         while (g_running) {
             char ch = 0;
-            if (read(STDIN_FILENO, &ch, 1) > 0){
+            if (read_input_char(&ch)){
                 if (ch == 'q' || ch == 'Q' || ch == 27) {
                     return 0;
                 }
@@ -674,7 +946,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
             }
-            usleep(15000);
+            sleep_ms(15);
         }
     }
 
@@ -689,7 +961,7 @@ int main(int argc, char *argv[]) {
     while (g_running){
         /* check user input */
         char ch = 0;
-        if (read(STDIN_FILENO, &ch, 1) > 0) {
+        if (read_input_char(&ch)) {
             if (ch == 'q' || ch == 'Q' || ch == 27){
                 break;
             } else if (ch == 's' || ch == 'S') {
@@ -699,22 +971,14 @@ int main(int argc, char *argv[]) {
                 g_paused = !g_paused;
                 if (g_paused) {
                     pause_start = get_time_ms();
-                    if (g_audio_pid > 0){
-                        kill(g_audio_pid, SIGSTOP);
-                    }
+                    pause_audio();
                 } else {
                     uint64_t p_dur = get_time_ms() - pause_start;
                     start_time += p_dur;
-                    if (g_audio_pid > 0) {
-                        kill(g_audio_pid, SIGCONT);
-                    }
+                    resume_audio();
                 }
             } else if (ch == 'r' || ch == 'R'){
-                if (g_audio_pid > 0) {
-                    kill(g_audio_pid, SIGTERM);
-                    waitpid(g_audio_pid, NULL, WNOHANG);
-                    g_audio_pid = 0;
-                }
+                stop_audio();
                 start_time = get_time_ms();
                 audio_started = false;
                 g_current_art_id = ART_NONE;
@@ -736,20 +1000,18 @@ int main(int argc, char *argv[]) {
                 if (elapsed > AUDIO_START_MS) {
                     seek_s = (double)(elapsed - AUDIO_START_MS) / 1000.0;
                 }
-                g_audio_pid = launch_audio_player(audio_path, seek_s);
+                start_audio(audio_path, seek_s);
                 audio_started = true;
             }
 
-            struct winsize ws;
-            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0){
-                ws.ws_row = 40;
-                ws.ws_col = 100;
-            }
+            int term_rows = 40;
+            int term_cols = 100;
+            get_terminal_size(&term_rows, &term_cols);
 
-            render_screen(elapsed, ws.ws_row, ws.ws_col);
+            render_screen(elapsed, term_rows, term_cols);
         }
 
-        usleep(16000);
+        sleep_ms(16);
     }
 
     return 0; //  finally

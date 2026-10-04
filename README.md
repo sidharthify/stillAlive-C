@@ -22,7 +22,8 @@ it runs inside standard terminal emulators, reproducing the aperture science ter
 
 * gcc or clang
 * make
-* any installed audio player (pw play, play, ffplay, mpv, or aplay)
+* **Linux / BSD / macOS**: any installed audio player (pw-play, play, ffplay, mpv, or aplay)
+* **Windows**: Windows 10/11 with Windows Terminal, PowerShell, or Command Prompt (audio is handled natively out of the box via Windows Multimedia)
 
 the audio tracks are included inside the res/song directory.
 

@@ -1,5 +1,9 @@
 # stillalive c
 
+<p align="center">
+  <img src="res/ss/ss.png" alt="Screenshot 1" width="900" style="border-radius:26px;"/>
+</p>
+
 A pure C terminal recreation of the Portal end credits sequence.
 
 it runs inside standard terminal emulators, reproducing the aperture science terminal aesthetic with character typing, scrolling credits, and ascii art synchronized to the track.

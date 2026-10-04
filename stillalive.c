@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "stillalive_data.h"
 
@@ -50,7 +51,6 @@ static scale_mode_t g_scale_mode = SCALE_ASPECT;
 static volatile sig_atomic_t g_winch_flag = 0;
 
 static struct termios g_orig_termios;
-static int g_orig_fcntl = 0;
 static bool g_raw_mode = false;
 static pid_t g_audio_pid = 0;
 static bool g_running = true;
@@ -72,20 +72,34 @@ static char g_grid[MAX_GRID_ROWS][MAX_GRID_COLS];
  * from the alternate screen buffer, and restoring canonical echo mode.
  * any child player spawned for audio is also cleaned up here.
  */
+static void write_all(int fd, const void *buf, size_t count){
+    const char *p = (const char *)buf;
+    while (count > 0){
+        ssize_t n = write(fd, p, count);
+        if (n < 0){
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK){
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000 };
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            break;
+        }
+        p += n;
+        count -= (size_t)n;
+    }
+}
+
 static void restore_terminal(void){
     if (g_audio_pid > 0) {
         kill(g_audio_pid, SIGTERM);
         waitpid(g_audio_pid, NULL, WNOHANG);
         g_audio_pid = 0;
     }
-    printf("\033[?7h\033[?25h\033[?1049l\033[0m");
+    printf("\033[?2025l\033[?7h\033[?25h\033[?1049l\033[0m");
     fflush(stdout);
     if (g_raw_mode){
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
         g_raw_mode = false;
-    }
-    if (g_orig_fcntl != 0) {
-        fcntl(STDIN_FILENO, F_SETFL, g_orig_fcntl);
     }
 }
 
@@ -109,10 +123,6 @@ static void handle_winch(int sig) {
  * or the quit key register immediately without waiting for enter.
  */
 static void enable_raw_mode(void){
-    g_orig_fcntl = fcntl(STDIN_FILENO, F_GETFL, 0);
-    if (g_orig_fcntl >= 0) {
-        fcntl(STDIN_FILENO, F_SETFL, g_orig_fcntl | O_NONBLOCK);
-    }
     if (tcgetattr(STDIN_FILENO, &g_orig_termios) != 0){
         return;
     }
@@ -566,15 +576,15 @@ static void render_screen(uint32_t elapsed_ms, int term_rows, int term_cols){
     int pos = 0;
 
     if (needs_clear){
-        pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[2J\033[H\033[38;2;222;190;95m");
+        pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[?2025h\033[2J\033[H\033[38;2;222;190;95m");
     } else {
-        pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[38;2;222;190;95m");
+        pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[?2025h\033[38;2;222;190;95m");
     }
 
     /*
      * direct cursor positioning per line without newline characters.
-     * printing newlines on the bottom terminal row causes terminal emulators
-     * to scroll the viewport, creating vertical jitter and shaking.
+     * positioning with target row and column avoids redrawing blanks
+     * and avoids the line erasing escape that causes terminal tearing.
      */
     for (int r = 0; r < frame_h; r += 1) {
         int target_row = off_y + r + 1;
@@ -582,18 +592,16 @@ static void render_screen(uint32_t elapsed_ms, int term_rows, int term_cols){
             break;
         }
         if (off_x > 0){
-            pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[%d;1H\033[2K%*s%s", target_row, off_x, "", g_grid[r]);
+            pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[%d;%dH%s", target_row, off_x + 1, g_grid[r]);
         } else {
-            pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[%d;1H\033[2K%s", target_row, g_grid[r]);
-        }
-        if ((size_t)pos > sizeof(out_buf) - 2048) {
-            write(STDOUT_FILENO, out_buf, pos);
-            pos = 0;
+            pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[%d;1H%s", target_row, g_grid[r]);
         }
     }
 
+    pos += snprintf(out_buf + pos, sizeof(out_buf) - pos, "\033[?2025l");
+
     if (pos > 0){
-        write(STDOUT_FILENO, out_buf, pos);
+        write_all(STDOUT_FILENO, out_buf, (size_t)pos);
     }
 }
 

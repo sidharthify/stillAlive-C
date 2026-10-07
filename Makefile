@@ -8,6 +8,10 @@ ifeq ($(OS),Windows_NT)
     LIBS ?= -lwinmm
     RM = del /f /q 2>nul || rm -f
 else
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Darwin)
+        CFLAGS += -D_DARWIN_C_SOURCE
+    endif
     TARGET_BIN = $(TARGET)
     LIBS ?=
     RM = rm -f

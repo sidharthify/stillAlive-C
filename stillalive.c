@@ -936,7 +936,7 @@ int main(int argc, char *argv[]) {
         while (g_running) {
             char ch = 0;
             if (read_input_char(&ch)){
-                if (ch == 'q' || ch == 'Q' || ch == 27) {
+                if (ch == 'q' || ch == 'Q') {
                     return 0;
                 }
                 if (ch == 's' || ch == 'S'){
@@ -958,11 +958,14 @@ int main(int argc, char *argv[]) {
     uint64_t pause_start = 0;
     bool audio_started = false;
 
+    char ch_old = 0;
+    char ch = 0;
+
     while (g_running){
         /* check user input */
-        char ch = 0;
+        ch_old = ch;
         if (read_input_char(&ch)) {
-            if (ch == 'q' || ch == 'Q' || ch == 27){
+            if (ch == 'q' || ch == 'Q'){
                 break;
             } else if (ch == 's' || ch == 'S') {
                 g_scale_mode = (g_scale_mode + 1) % SCALE_MAX;
@@ -988,6 +991,10 @@ int main(int argc, char *argv[]) {
                 g_paused = false;
                 g_winch_flag = 1;
             }
+        }
+
+        if (ch == ch_old && ch == 27) {
+            break;
         }
 
         if (!g_paused) {

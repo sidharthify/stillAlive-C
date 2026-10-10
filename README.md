@@ -64,6 +64,18 @@ make run
 * `./stillalive fill` : expands the boxes to fill the entire window dimensions
 * `./stillalive classic` : uses the fixed 98x38 character box
 
+## browser
+
+the same C source also runs in the browser, compiled to webassembly with emscripten and drawn with xterm.js.
+
+```bash
+make web
+```
+
+this writes a static site to `build/web` (needs `emcc` on your path). serve that folder with any static file server. options go in the url query, e.g. `index.html?fill&start=25000`.
+
+pushing to `main` builds and deploys it automatically through github pages (`.github/workflows/pages.yml`), so you don't need emscripten installed locally. enable it once under settings, pages, source: github actions.
+
 ### controls
 
 * `space` : pause or resume

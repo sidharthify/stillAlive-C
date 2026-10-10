@@ -47,6 +47,10 @@
 #include <errno.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include "stillalive_data.h"
 
 #define CHAR_DASH 0x2d
@@ -134,6 +138,51 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     return TRUE;
 }
 
+#elif defined(__EMSCRIPTEN__)
+/*
+ * browser build. the page (web/index.html) owns the xterm.js terminal,
+ * the key queue and an html audio element. these hooks call into it.
+ */
+EM_JS(void, js_write, (const char *buf, size_t len), {
+    Module.sa.write(HEAPU8.subarray(buf, buf + len));
+});
+EM_JS(int, js_read_key, (void), { return Module.sa.readKey(); });
+EM_JS(int, js_term_rows, (void), { return Module.sa.rows(); });
+EM_JS(int, js_term_cols, (void), { return Module.sa.cols(); });
+EM_JS(void, js_audio_start, (double start_sec), { Module.sa.audioStart(start_sec); });
+EM_JS(void, js_audio_pause, (void), { Module.sa.audioPause(); });
+EM_JS(void, js_audio_resume, (void), { Module.sa.audioResume(); });
+EM_JS(void, js_audio_stop, (void), { Module.sa.audioStop(); });
+
+static struct termios g_orig_termios;
+static bool g_audio_playing = false;
+
+static void stop_audio(void) {
+    if (g_audio_playing) {
+        js_audio_stop();
+        g_audio_playing = false;
+    }
+}
+
+static void pause_audio(void) {
+    if (g_audio_playing) {
+        js_audio_pause();
+    }
+}
+
+static void resume_audio(void) {
+    if (g_audio_playing) {
+        js_audio_resume();
+    }
+}
+
+/* the page picks the audio url itself, the local path is not used */
+static void start_audio(const char *path, double start_sec) {
+    (void)path;
+    js_audio_start(start_sec);
+    g_audio_playing = true;
+}
+
 #else
 static struct termios g_orig_termios;
 static pid_t g_audio_pid = 0;
@@ -189,6 +238,9 @@ static void write_all(int fd, const void *buf, size_t count){
         p += written;
         count -= (size_t)written;
     }
+#elif defined(__EMSCRIPTEN__)
+    (void)fd;
+    js_write((const char *)buf, count);
 #else
     const char *p = (const char *)buf;
     while (count > 0){
@@ -318,6 +370,9 @@ static uint64_t get_time_ms(void){
 static void sleep_ms(uint32_t ms){
 #ifdef _WIN32
     Sleep(ms);
+#elif defined(__EMSCRIPTEN__)
+    /* yields to the browser event loop (needs -sASYNCIFY) */
+    emscripten_sleep(ms);
 #else
     usleep(ms * 1000);
 #endif
@@ -356,6 +411,13 @@ static bool read_input_char(char *ch){
         }
         return false;
     }
+#elif defined(__EMSCRIPTEN__)
+    int c = js_read_key();
+    if (c < 0) {
+        return false;
+    }
+    *ch = (char)c;
+    return true;
 #else
     char c = 0;
     if (read(STDIN_FILENO, &c, 1) > 0) {
@@ -377,6 +439,9 @@ static void get_terminal_size(int *rows, int *cols){
         *cols = 100;
         *rows = 40;
     }
+#elif defined(__EMSCRIPTEN__)
+    *rows = js_term_rows();
+    *cols = js_term_cols();
 #else
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
@@ -434,7 +499,7 @@ static const char *find_audio_file(void){
     return NULL;
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 /*
  * rather than linking a heavy audio framework, we fork an external player.
  * pipewire, pulseaudio, sox, alsa, and ffmpeg CLI tools are probed in order

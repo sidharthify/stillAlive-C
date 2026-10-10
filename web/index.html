@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Still Alive</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #term { position: absolute; inset: 0; }
+  .xterm .xterm-viewport { overflow-y: hidden; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script>
+/*
+ * glue between the C program (built with emscripten) and the browser.
+ * stillalive.c calls the Module.sa hooks below for output, keys,
+ * terminal size and audio. everything else runs unchanged.
+ */
+(function () {
+  const AMBER = '#debe5f';
+  const MIN_COLS = 100;
+  const MIN_ROWS = 40;
+
+  const term = new Terminal({
+    fontFamily: '"Cascadia Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace',
+    theme: { background: '#000000', foreground: AMBER, cursor: '#000000' },
+    cursorBlink: false,
+    convertEol: true, /* \n acts like a real tty's \r\n */
+    scrollback: 0,
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+
+  /* pick a font size so the classic 98x38 frame always fits, then fill the window */
+  function resize() {
+    const byW = window.innerWidth / (MIN_COLS * 0.6);
+    const byH = window.innerHeight / (MIN_ROWS * 1.2);
+    const size = Math.max(6, Math.min(20, Math.floor(Math.min(byW, byH))));
+    if (term.options.fontSize !== size) term.options.fontSize = size;
+    fit.fit();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  term.focus();
+
+  /* output: printf goes through Module.stdout byte by byte, frames through write() */
+  let pending = [];
+  function flushPending() {
+    if (pending.length) {
+      term.write(new Uint8Array(pending));
+      pending = [];
+    }
+  }
+
+  /* input */
+  const keys = [];
+  let exited = false;
+  term.onData(function (data) {
+    if (exited) { location.reload(); return; }
+    for (const ch of new TextEncoder().encode(data)) keys.push(ch);
+  });
+
+  /* audio, with a retry for browsers that block playback until an interaction */
+  const audio = new Audio('res/song/stillalive.mp3');
+  audio.preload = 'auto';
+  let wantPlaying = false;
+  let baseTime = 0;
+  let pausedAt = 0;
+
+  function play() {
+    audio.play().catch(function () {});
+  }
+  function retryAudio() {
+    if (wantPlaying && audio.paused) {
+      audio.currentTime = (performance.now() - baseTime) / 1000;
+      play();
+    }
+  }
+  window.addEventListener('keydown', retryAudio);
+  window.addEventListener('pointerdown', function () { retryAudio(); term.focus(); });
+
+  /* url query becomes argv, e.g. ?autoplay&fill or ?start=25000 */
+  const args = [];
+  for (const [k, v] of new URLSearchParams(location.search)) {
+    args.push(v ? k + '=' + v : k);
+  }
+
+  window.Module = {
+    arguments: args,
+    stdin: function () { return null; },
+    stdout: function (c) {
+      if (c === null) { flushPending(); return; }
+      pending.push(c);
+      if (pending.length === 1) queueMicrotask(flushPending);
+    },
+    onExit: function () {
+      exited = true;
+      wantPlaying = false;
+      audio.pause();
+      flushPending();
+      term.write('\x1b[0m\x1b[2J\x1b[H\r\n  Goodbye.\r\n\r\n  Press any key to restart.');
+    },
+    sa: {
+      write: function (bytes) {
+        flushPending();
+        term.write(bytes.slice());
+      },
+      readKey: function () { return keys.length ? keys.shift() : -1; },
+      rows: function () { return term.rows; },
+      cols: function () { return term.cols; },
+      audioStart: function (sec) {
+        wantPlaying = true;
+        baseTime = performance.now() - sec * 1000;
+        audio.currentTime = sec;
+        play();
+      },
+      audioPause: function () {
+        pausedAt = performance.now();
+        wantPlaying = false;
+        audio.pause();
+      },
+      audioResume: function () {
+        baseTime += performance.now() - pausedAt;
+        wantPlaying = true;
+        play();
+      },
+      audioStop: function () {
+        wantPlaying = false;
+        audio.pause();
+        audio.currentTime = 0;
+      },
+    },
+  };
+
+  /* the boot screen is drawn once, so wait until the window has a real size */
+  (function boot() {
+    if (!window.innerWidth || !window.innerHeight) {
+      requestAnimationFrame(boot);
+      return;
+    }
+    resize();
+    const script = document.createElement('script');
+    script.src = 'stillalive.js';
+    document.body.appendChild(script);
+  })();
+})();
+</script>
+</body>
+</html>
